@@ -56,6 +56,13 @@ Backwards Compatibility Notes
   functionality of stopping at frame boundaries, start explicitly passing
   ``read_across_frames=False`` to preserve the current behavior.
 
+Bug Fixes
+---------
+
+* ``ZstdDecompressor.decompress()`` with ``allow_extra_data=False`` would
+  previously allow extra data to exist after an *empty* zstd frame (a frame
+  holding 0 length input). This scenario now raises an exception.
+
 Changes
 -------
 
