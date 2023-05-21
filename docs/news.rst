@@ -51,10 +51,14 @@ Other Actions Not Blocking Release
 Backwards Compatibility Notes
 -----------------------------
 
-* ``ZstdDecompressor.decompressobj()`` will change ``read_across_frames`` to
+* ``ZstdDecompressor.stream_reader()``, ``ZstdDecompressor.decompressobj()``,
+  and ``ZstdDecompressor.decompress()`` will change ``read_across_frames`` to
   default to ``True`` in a future release. If you depend on the current
   functionality of stopping at frame boundaries, start explicitly passing
   ``read_across_frames=False`` to preserve the current behavior.
+* ``ZstdDecompressor.decompress()`` will change ``allow_extra_data`` to default
+  to ``False`` in a future release to facilitate compatibility with
+  ``read_across_frames=True``.
 
 Bug Fixes
 ---------
