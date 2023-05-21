@@ -3748,11 +3748,7 @@ class ZstdDecompressor(object):
 
         ``read_across_frames`` controls whether to read multiple zstandard
         frames in the input. When False, decompression stops after reading the
-        first frame. This feature is not yet implemented but the argument is
-        provided for forward API compatibility when the default is changed to
-        True in a future release. For now, if you need to decompress multiple
-        frames, use an API like :py:meth:`ZstdCompressor.stream_reader` with
-        ``read_across_frames=True``.
+        first frame. When True, reads are performed across frames transparently.
 
         ``allow_extra_data`` controls how to handle extra input data after a
         fully decoded frame. If False, any extra data (which could be a valid
@@ -3760,10 +3756,9 @@ class ZstdDecompressor(object):
         data is silently ignored. The default will likely change to False in a
         future release when ``read_across_frames`` defaults to True.
 
-        If the input contains extra data after a full frame, that extra input
-        data is silently ignored. This behavior is undesirable in many scenarios
-        and will likely be changed or controllable in a future release (see
-        #181).
+        Passing both ``read_across_frames=True`` and ``allow_extra_data=True``
+        raises. Since ``allow_extra_data=True`` is the default, in order to read
+        multiple frames you need to explicitly pass ``allow_extra_data=False``.
 
         If the frame header of the compressed data does not contain the content
         size, ``max_output_size`` must be specified or ``ZstdError`` will be
@@ -3771,6 +3766,11 @@ class ZstdDecompressor(object):
         attempt will be made to perform decompression into that buffer. If the
         buffer is too small or cannot be allocated, ``ZstdError`` will be
         raised. The buffer will be resized if it is too large.
+
+        Due to internal implementation details, total memory allocated at any
+        given time may be larger than ``max_output_size``. However, the returned
+        data is guaranteed to be no larger than the length specified by
+        ``max_output_size``.
 
         Uncompressed data could be much larger than compressed data. As a result,
         calling this function could result in a very large memory allocation
@@ -3807,69 +3807,114 @@ class ZstdDecompressor(object):
 
            If ``0``, there is no limit and we can attempt to allocate an output
            buffer of infinite size.
+        :param read_across_frames
+           Whether to attempt to decompress multiple zstd frames. If False,
+           decompression stops after a full frame is decoded.
+        :param allow_extra_data
+           Whether to allow extra data to exist after a zstd frame is read.
+           If False, any data remaining in the input after a zstd frame decode
+           will raise an exception.
         :return:
            ``bytes`` representing decompressed output.
         """
 
-        if read_across_frames:
+        if read_across_frames and allow_extra_data:
             raise ZstdError(
-                "ZstdDecompressor.read_across_frames=True is not yet implemented"
+                "read_across_frames and allow_extra_data cannot both be true"
             )
 
         self._ensure_dctx()
 
         data_buffer = ffi.from_buffer(data)
 
-        output_size = lib.ZSTD_getFrameContentSize(
-            data_buffer, len(data_buffer)
-        )
-
-        if output_size == lib.ZSTD_CONTENTSIZE_ERROR:
-            raise ZstdError("error determining content size from frame header")
-        elif output_size == lib.ZSTD_CONTENTSIZE_UNKNOWN:
-            if not max_output_size:
-                raise ZstdError(
-                    "could not determine content size in frame header"
-                )
-
-            result_buffer = ffi.new("char[]", max_output_size)
-            result_size = max_output_size
-            output_size = 0
-        else:
-            result_buffer = ffi.new("char[]", output_size)
-            result_size = output_size
-
-        out_buffer = ffi.new("ZSTD_outBuffer *")
-        out_buffer.dst = result_buffer
-        out_buffer.size = result_size
-        out_buffer.pos = 0
-
         in_buffer = ffi.new("ZSTD_inBuffer *")
         in_buffer.src = data_buffer
         in_buffer.size = len(data_buffer)
         in_buffer.pos = 0
 
-        zresult = lib.ZSTD_decompressStream(self._dctx, out_buffer, in_buffer)
-        if lib.ZSTD_isError(zresult):
-            raise ZstdError("decompression error: %s" % _zstd_error(zresult))
-        elif zresult:
-            raise ZstdError(
-                "decompression error: did not decompress full frame"
-            )
-        elif output_size and out_buffer.pos != output_size:
-            raise ZstdError(
-                "decompression error: decompressed %d bytes; expected %d"
-                % (zresult, output_size)
-            )
-        elif not allow_extra_data and in_buffer.pos < in_buffer.size:
-            count = in_buffer.size - in_buffer.pos
+        out_chunks = []
+        current_output_size = 0
 
-            raise ZstdError(
-                "compressed input contains %d bytes of unused data, which is disallowed"
-                % count
+        while True:
+            # Try to decode full frames at a time.
+            output_size = lib.ZSTD_getFrameContentSize(
+                data_buffer[in_buffer.pos : in_buffer.size],
+                in_buffer.size - in_buffer.pos,
             )
 
-        return ffi.buffer(result_buffer, out_buffer.pos)[:]
+            if output_size == lib.ZSTD_CONTENTSIZE_ERROR:
+                raise ZstdError(
+                    "error determining content size from frame header"
+                )
+            elif output_size == lib.ZSTD_CONTENTSIZE_UNKNOWN:
+                if not max_output_size:
+                    raise ZstdError(
+                        "could not determine content size in frame header"
+                    )
+
+                result_buffer = ffi.new("char[]", max_output_size)
+                result_size = max_output_size
+                output_size = 0
+            else:
+                result_buffer = ffi.new("char[]", output_size)
+                result_size = output_size
+
+            if (
+                max_output_size
+                and current_output_size + result_size > max_output_size
+            ):
+                raise ZstdError(
+                    "max allowed output size reached; would read up to %d bytes"
+                    % (current_output_size + result_size)
+                )
+
+            out_buffer = ffi.new("ZSTD_outBuffer *")
+            out_buffer.dst = result_buffer
+            out_buffer.size = result_size
+            out_buffer.pos = 0
+
+            zresult = lib.ZSTD_decompressStream(
+                self._dctx, out_buffer, in_buffer
+            )
+            if lib.ZSTD_isError(zresult):
+                raise ZstdError(
+                    "decompression error: %s" % _zstd_error(zresult)
+                )
+            elif zresult:
+                raise ZstdError(
+                    "decompression error: did not decompress full frame"
+                )
+            elif output_size and out_buffer.pos != output_size:
+                raise ZstdError(
+                    "decompression error: decompressed %d bytes; expected %d"
+                    % (zresult, output_size)
+                )
+
+            # We must have read a full frame. Always save a copy.
+            assert zresult == 0
+            out_chunks.append(ffi.buffer(result_buffer, out_buffer.pos)[:])
+            current_output_size += out_buffer.pos
+
+            # We've exhausted the input. There's nothing left to do.
+            if in_buffer.pos == in_buffer.size:
+                break
+
+            # There's more data to be read.
+
+            # Attempt to read the next frame if allowed.
+            if read_across_frames:
+                continue
+            elif allow_extra_data:
+                break
+            else:
+                count = in_buffer.size - in_buffer.pos
+
+                raise ZstdError(
+                    "compressed input contains %d bytes of unused data, which is disallowed"
+                    % count
+                )
+
+        return b"".join(out_chunks)
 
     def stream_reader(
         self,

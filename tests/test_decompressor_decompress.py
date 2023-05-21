@@ -176,6 +176,15 @@ class TestDecompressor_decompress(unittest.TestCase):
         )
         self.assertEqual(dctx.decompress(compressed), b"foo")
 
+    def test_read_across_frames_and_allow_extra_data(self):
+        with self.assertRaisesRegex(
+            zstd.ZstdError,
+            "read_across_frames and allow_extra_data cannot both be true",
+        ):
+            zstd.ZstdDecompressor().decompress(
+                b"irrelevant", read_across_frames=True, allow_extra_data=True
+            )
+
     def test_multiple_frames(self):
         cctx = zstd.ZstdCompressor()
         foo = cctx.compress(b"foo")
@@ -186,18 +195,37 @@ class TestDecompressor_decompress(unittest.TestCase):
         self.assertEqual(
             dctx.decompress(foo + bar, allow_extra_data=True), b"foo"
         )
+        self.assertEqual(
+            dctx.decompress(
+                foo + bar, read_across_frames=True, allow_extra_data=False
+            ),
+            b"foobar",
+        )
+
+    def test_multiple_frames_max_output_size(self):
+        """A subsequent frame overflowing the max output size raises an error."""
+        cctx = zstd.ZstdCompressor()
+
+        foo_source = b"foo" * 1024
+        bar_source = b"bar" * 128
+
+        foo_frame = cctx.compress(foo_source)
+        bar_frame = cctx.compress(bar_source)
+
+        total_input_size = len(foo_source) + len(bar_source)
+
+        dctx = zstd.ZstdDecompressor()
 
         with self.assertRaisesRegex(
             zstd.ZstdError,
-            "ZstdDecompressor.read_across_frames=True is not yet implemented",
+            "max allowed output size reached; would read up to 3456 bytes",
         ):
-            dctx.decompress(foo + bar, read_across_frames=True)
-
-        with self.assertRaisesRegex(
-            zstd.ZstdError,
-            "%d bytes of unused data, which is disallowed" % len(bar),
-        ):
-            dctx.decompress(foo + bar, allow_extra_data=False)
+            dctx.decompress(
+                foo_frame + bar_frame,
+                read_across_frames=True,
+                allow_extra_data=False,
+                max_output_size=len(foo_source) + 8,
+            )
 
     def test_junk_after_frame(self):
         cctx = zstd.ZstdCompressor()
@@ -214,6 +242,14 @@ class TestDecompressor_decompress(unittest.TestCase):
             zstd.ZstdError, "4 bytes of unused data, which is disallowed"
         ):
             dctx.decompress(frame + b"junk", allow_extra_data=False)
+
+        with self.assertRaisesRegex(
+            zstd.ZstdError,
+            "error determining content size from frame header",
+        ):
+            dctx.decompress(
+                frame + b"junk", read_across_frames=True, allow_extra_data=False
+            )
 
     def test_data_after_empty_frame(self):
         cctx = zstd.ZstdCompressor()
@@ -233,3 +269,12 @@ class TestDecompressor_decompress(unittest.TestCase):
             "compressed input contains 12 bytes of unused data, which is disallowed",
         ):
             dctx.decompress(empty_frame + foo_frame, allow_extra_data=False)
+
+        self.assertEqual(
+            dctx.decompress(
+                empty_frame + foo_frame,
+                read_across_frames=True,
+                allow_extra_data=False,
+            ),
+            b"foo",
+        )

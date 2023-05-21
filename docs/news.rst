@@ -70,6 +70,11 @@ Changes
   boolean named argument to control whether to transparently read across
   multiple zstd frames. It defaults to ``False`` to preserve existing
   behavior.
+* ``ZstdDecompressor.decompress()`` now supports ``read_across_frames=True``.
+  Before, attempting to use this argument value would raise an exception.
+  ``read_across_frames=True`` cannot be used with ``allow_extra_data=True``
+  (which is the default value). To read across frames, you need to explicitly
+  pass ``allow_extra_data=False``.
 
 0.21.0 (released 2023-04-16)
 ============================

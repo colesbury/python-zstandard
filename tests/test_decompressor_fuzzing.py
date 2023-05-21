@@ -63,6 +63,33 @@ class TestDecompressor_decompress_fuzzing(unittest.TestCase):
                 allow_extra_data=False,
             )
 
+    @hypothesis.given(
+        source_chunks=strategies.lists(
+            strategies.sampled_from(random_input_data()),
+            min_size=2,
+            max_size=10,
+        ),
+        level=strategies.integers(min_value=1, max_value=5),
+    )
+    def test_read_across_frames_true(self, source_chunks, level):
+        source = io.BytesIO()
+        compressed = io.BytesIO()
+
+        cctx = zstd.ZstdCompressor(level=level)
+
+        for chunk in source_chunks:
+            source.write(chunk)
+            compressed.write(cctx.compress(chunk))
+
+        dctx = zstd.ZstdDecompressor()
+
+        res = dctx.decompress(
+            compressed.getvalue(),
+            read_across_frames=True,
+            allow_extra_data=False,
+        )
+        self.assertEqual(res, source.getvalue())
+
 
 @unittest.skipUnless("ZSTD_SLOW_TESTS" in os.environ, "ZSTD_SLOW_TESTS not set")
 class TestDecompressor_stream_reader_fuzzing(unittest.TestCase):

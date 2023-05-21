@@ -262,13 +262,8 @@ finally:
 
 PyObject *Decompressor_decompress(ZstdDecompressor *self, PyObject *args,
                                   PyObject *kwargs) {
-    static char *kwlist[] = {
-        "data",
-        "max_output_size",
-        "read_across_frames",
-        "allow_extra_data",
-        NULL
-    };
+    static char *kwlist[] = {"data", "max_output_size", "read_across_frames",
+                             "allow_extra_data", NULL};
 
     Py_buffer source;
     Py_ssize_t maxOutputSize = 0;
@@ -277,10 +272,14 @@ PyObject *Decompressor_decompress(ZstdDecompressor *self, PyObject *args,
     PyObject *readAcrossFrames = NULL;
     PyObject *allowExtraData = NULL;
     size_t destCapacity;
+    size_t currentOutputSize = 0;
     PyObject *result = NULL;
+    PyObject *chunks = NULL;
+    PyObject *chunk = NULL;
     size_t zresult;
     ZSTD_outBuffer outBuffer;
     ZSTD_inBuffer inBuffer;
+    PyObject *empty = NULL;
 
     if (!PyArg_ParseTupleAndKeywords(args, kwargs, "y*|nOO:decompress", kwlist,
                                      &source, &maxOutputSize, &readAcrossFrames,
@@ -288,104 +287,152 @@ PyObject *Decompressor_decompress(ZstdDecompressor *self, PyObject *args,
         return NULL;
     }
 
-    if (readAcrossFrames ? PyObject_IsTrue(readAcrossFrames) : 0) {
-        PyErr_SetString(ZstdError,
-            "ZstdDecompressor.read_across_frames=True is not yet implemented"
-        );
-        goto finally;
+    if ((readAcrossFrames ? PyObject_IsTrue(readAcrossFrames) : 0 == 1) &&
+        (allowExtraData ? PyObject_IsTrue(allowExtraData) : 1 == 1)) {
+        PyErr_SetString(
+            ZstdError,
+            "read_across_frames and allow_extra_data cannot both be true");
+        goto except;
     }
 
     if (ensure_dctx(self, 1)) {
         goto finally;
     }
 
-    decompressedSize = ZSTD_getFrameContentSize(source.buf, source.len);
-
-    if (ZSTD_CONTENTSIZE_ERROR == decompressedSize) {
-        PyErr_SetString(ZstdError,
-                        "error determining content size from frame header");
+    chunks = PyList_New(0);
+    if (NULL == chunks) {
         goto finally;
     }
-    /* Missing content size in frame header. */
-    else if (ZSTD_CONTENTSIZE_UNKNOWN == decompressedSize) {
-        if (0 == maxOutputSize) {
-            PyErr_SetString(ZstdError,
-                            "could not determine content size in frame header");
-            goto finally;
-        }
-
-        result = PyBytes_FromStringAndSize(NULL, maxOutputSize);
-        destCapacity = maxOutputSize;
-        decompressedSize = 0;
-    }
-    /* Size is recorded in frame header. */
-    else {
-        assert(SIZE_MAX >= PY_SSIZE_T_MAX);
-        if (decompressedSize > PY_SSIZE_T_MAX) {
-            PyErr_SetString(
-                ZstdError, "frame is too large to decompress on this platform");
-            goto finally;
-        }
-
-        result = PyBytes_FromStringAndSize(NULL, (Py_ssize_t)decompressedSize);
-        destCapacity = (size_t)decompressedSize;
-    }
-
-    if (!result) {
-        goto finally;
-    }
-
-    outBuffer.dst = PyBytes_AsString(result);
-    outBuffer.size = destCapacity;
-    outBuffer.pos = 0;
 
     inBuffer.src = source.buf;
     inBuffer.size = source.len;
     inBuffer.pos = 0;
 
-    Py_BEGIN_ALLOW_THREADS zresult =
-        ZSTD_decompressStream(self->dctx, &outBuffer, &inBuffer);
-    Py_END_ALLOW_THREADS
+    while (1) {
+        decompressedSize = ZSTD_getFrameContentSize(
+            (void*)((char*)inBuffer.src + inBuffer.pos), inBuffer.size - inBuffer.pos);
 
-        if (ZSTD_isError(zresult)) {
-        PyErr_Format(ZstdError, "decompression error: %s",
-                     ZSTD_getErrorName(zresult));
-        Py_CLEAR(result);
-        goto finally;
-    }
-    else if (zresult) {
-        PyErr_Format(ZstdError,
-                     "decompression error: did not decompress full frame");
-        Py_CLEAR(result);
-        goto finally;
-    }
-    else if (decompressedSize && outBuffer.pos != decompressedSize) {
-        PyErr_Format(
-            ZstdError,
-            "decompression error: decompressed %zu bytes; expected %llu",
-            zresult, decompressedSize);
-        Py_CLEAR(result);
-        goto finally;
-    }
-    else if (outBuffer.pos < destCapacity) {
-        if (safe_pybytes_resize(&result, outBuffer.pos)) {
-            Py_CLEAR(result);
-            goto finally;
+        if (ZSTD_CONTENTSIZE_ERROR == decompressedSize) {
+            PyErr_SetString(ZstdError,
+                            "error determining content size from frame header");
+            goto except;
+        }
+        /* Missing content size in frame header. */
+        else if (ZSTD_CONTENTSIZE_UNKNOWN == decompressedSize) {
+            if (0 == maxOutputSize) {
+                PyErr_SetString(
+                    ZstdError,
+                    "could not determine content size in frame header");
+                goto except;
+            }
+
+            chunk = PyBytes_FromStringAndSize(NULL, maxOutputSize);
+            destCapacity = maxOutputSize;
+            decompressedSize = 0;
+        }
+        /* Size is recorded in frame header. */
+        else {
+            assert(SIZE_MAX >= PY_SSIZE_T_MAX);
+            if (decompressedSize > PY_SSIZE_T_MAX) {
+                PyErr_SetString(
+                    ZstdError,
+                    "frame is too large to decompress on this platform");
+                goto except;
+            }
+
+            chunk =
+                PyBytes_FromStringAndSize(NULL, (Py_ssize_t)decompressedSize);
+            destCapacity = (size_t)decompressedSize;
+        }
+
+        if (!chunk) {
+            goto except;
+        }
+
+        if (maxOutputSize &&
+            currentOutputSize + destCapacity > (size_t)maxOutputSize) {
+            PyErr_Format(
+                ZstdError,
+                "max allowed output size reached; would read up to %d bytes",
+                currentOutputSize + destCapacity);
+            goto except;
+        }
+
+        outBuffer.dst = PyBytes_AsString(chunk);
+        outBuffer.size = destCapacity;
+        outBuffer.pos = 0;
+
+        Py_BEGIN_ALLOW_THREADS zresult =
+            ZSTD_decompressStream(self->dctx, &outBuffer, &inBuffer);
+        Py_END_ALLOW_THREADS
+
+            if (ZSTD_isError(zresult)) {
+            PyErr_Format(ZstdError, "decompression error: %s",
+                         ZSTD_getErrorName(zresult));
+            goto except;
+        }
+        else if (zresult) {
+            PyErr_Format(ZstdError,
+                         "decompression error: did not decompress full frame");
+            goto except;
+        }
+        else if (decompressedSize && outBuffer.pos != decompressedSize) {
+            PyErr_Format(
+                ZstdError,
+                "decompression error: decompressed %zu bytes; expected %llu",
+                zresult, decompressedSize);
+            goto except;
+        }
+
+        assert(zresult == 0);
+
+        if (outBuffer.pos < destCapacity) {
+            if (safe_pybytes_resize(&chunk, outBuffer.pos)) {
+                goto except;
+            }
+        }
+
+        if (PyList_Append(chunks, chunk)) {
+            goto except;
+        }
+        Py_CLEAR(chunk);
+        currentOutputSize += outBuffer.pos;
+
+        if (inBuffer.pos == inBuffer.size) {
+            break;
+        }
+
+        if ((readAcrossFrames ? PyObject_IsTrue(readAcrossFrames) : 0) == 1) {
+            continue;
+        }
+        else if ((allowExtraData ? PyObject_IsTrue(allowExtraData) : 1) == 1) {
+            break;
+        }
+        else {
+            PyErr_Format(ZstdError,
+                         "compressed input contains %zu bytes of unused data, "
+                         "which is disallowed",
+                         inBuffer.size - inBuffer.pos);
+            goto except;
         }
     }
-    else if ((allowExtraData ? PyObject_IsTrue(allowExtraData) : 1) == 0
-             && inBuffer.pos < inBuffer.size) {
-        PyErr_Format(
-            ZstdError,
-            "compressed input contains %zu bytes of unused data, which is disallowed",
-            inBuffer.size - inBuffer.pos
-        );
-        Py_CLEAR(result);
-        goto finally;
+
+    empty = PyBytes_FromStringAndSize("", 0);
+    if (NULL == empty) {
+        goto except;
     }
+
+    result = PyObject_CallMethod(empty, "join", "O", chunks);
+    goto finally;
+
+except:
+    Py_CLEAR(result);
 
 finally:
     PyBuffer_Release(&source);
+    Py_XDECREF(chunks);
+    Py_XDECREF(chunk);
+    Py_XDECREF(empty);
     return result;
 }
 

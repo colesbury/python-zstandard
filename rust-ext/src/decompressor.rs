@@ -167,39 +167,14 @@ impl ZstdDecompressor {
         max_output_size: usize,
         read_across_frames: bool,
         allow_extra_data: bool,
-    ) -> PyResult<&'p PyBytes> {
-        if read_across_frames {
+    ) -> PyResult<&'p PyAny> {
+        if read_across_frames && allow_extra_data {
             return Err(ZstdError::new_err(
-                "ZstdDecompressor.read_across_frames=True is not yet implemented",
+                "read_across_frames and allow_extra_data cannot both be true",
             ));
         }
 
         self.setup_dctx(py, true)?;
-
-        let output_size =
-            unsafe { zstd_sys::ZSTD_getFrameContentSize(buffer.buf_ptr(), buffer.len_bytes()) };
-
-        let (output_buffer_size, output_size) =
-            if output_size == zstd_sys::ZSTD_CONTENTSIZE_ERROR as _ {
-                return Err(ZstdError::new_err(
-                    "error determining content size from frame header",
-                ));
-            } else if output_size == zstd_sys::ZSTD_CONTENTSIZE_UNKNOWN as _ {
-                if max_output_size == 0 {
-                    return Err(ZstdError::new_err(
-                        "could not determine content size in frame header",
-                    ));
-                }
-
-                (max_output_size, 0)
-            } else {
-                (output_size as _, output_size)
-            };
-
-        let mut dest_buffer: Vec<u8> = Vec::new();
-        dest_buffer
-            .try_reserve_exact(output_buffer_size)
-            .map_err(|_| PyMemoryError::new_err(()))?;
 
         let mut in_buffer = zstd_sys::ZSTD_inBuffer {
             src: buffer.buf_ptr(),
@@ -207,29 +182,84 @@ impl ZstdDecompressor {
             pos: 0,
         };
 
-        let zresult = self
-            .dctx
-            .decompress_into_vec(&mut dest_buffer, &mut in_buffer)
-            .map_err(|msg| ZstdError::new_err(format!("decompression error: {}", msg)))?;
+        let chunks = PyList::empty(py);
+        let mut current_output_size = 0;
 
-        if zresult != 0 {
-            Err(ZstdError::new_err(
-                "decompression error: did not decompress full frame",
-            ))
-        } else if output_size != 0 && dest_buffer.len() != output_size as _ {
-            Err(ZstdError::new_err(format!(
-                "decompression error: decompressed {} bytes; expected {}",
-                zresult, output_size
-            )))
-        } else if !allow_extra_data && in_buffer.pos < in_buffer.size {
-            Err(ZstdError::new_err(format!(
-                "compressed input contains {} bytes of unused data, which is disallowed",
-                in_buffer.size - in_buffer.pos
-            )))
-        } else {
-            // TODO avoid memory copy
-            Ok(PyBytes::new(py, &dest_buffer))
+        loop {
+            let output_size = unsafe {
+                zstd_sys::ZSTD_getFrameContentSize(
+                    in_buffer.src.offset(in_buffer.pos as _),
+                    in_buffer.size - in_buffer.pos,
+                )
+            };
+
+            let (output_buffer_size, output_size) =
+                if output_size == zstd_sys::ZSTD_CONTENTSIZE_ERROR as _ {
+                    return Err(ZstdError::new_err(
+                        "error determining content size from frame header",
+                    ));
+                } else if output_size == zstd_sys::ZSTD_CONTENTSIZE_UNKNOWN as _ {
+                    if max_output_size == 0 {
+                        return Err(ZstdError::new_err(
+                            "could not determine content size in frame header",
+                        ));
+                    }
+
+                    (max_output_size, 0)
+                } else {
+                    (output_size as _, output_size)
+                };
+
+            if max_output_size > 0 && current_output_size + output_buffer_size > max_output_size {
+                return Err(ZstdError::new_err(format!(
+                    "max allowed output size reached; would read up to {} bytes",
+                    current_output_size + output_buffer_size
+                )));
+            }
+
+            let mut dest_buffer: Vec<u8> = Vec::new();
+            dest_buffer
+                .try_reserve_exact(output_buffer_size)
+                .map_err(|_| PyMemoryError::new_err(()))?;
+
+            let zresult = self
+                .dctx
+                .decompress_into_vec(&mut dest_buffer, &mut in_buffer)
+                .map_err(|msg| ZstdError::new_err(format!("decompression error: {}", msg)))?;
+
+            if zresult != 0 {
+                return Err(ZstdError::new_err(
+                    "decompression error: did not decompress full frame",
+                ));
+            } else if output_size != 0 && dest_buffer.len() != output_size as _ {
+                return Err(ZstdError::new_err(format!(
+                    "decompression error: decompressed {} bytes; expected {}",
+                    zresult, output_size
+                )));
+            }
+
+            // TODO avoid buffer copy.
+            chunks.append(PyBytes::new(py, &dest_buffer))?;
+            current_output_size += dest_buffer.len();
+
+            if in_buffer.pos == in_buffer.size {
+                break;
+            }
+
+            if read_across_frames {
+                continue;
+            } else if allow_extra_data {
+                break;
+            } else {
+                return Err(ZstdError::new_err(format!(
+                    "compressed input contains {} bytes of unused data, which is disallowed",
+                    in_buffer.size - in_buffer.pos
+                )));
+            }
         }
+
+        let empty = PyBytes::new(py, &[]);
+        empty.call_method1("join", (chunks,))
     }
 
     fn decompress_content_dict_chain<'p>(
